@@ -1,2 +1,5 @@
 myenv_*/
 data_*/
+*.pyc
+*.json
+*.npy
