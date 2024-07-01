@@ -308,39 +308,40 @@ class ClusterClassifier:
             self._show_mpl(df)
 
     def _show_mpl(self, df):
-        fig, ax = plt.subplots(figsize=(12, 8), dpi=300)
+        fig, ax = plt.subplots(figsize=(20, 16), dpi=300)
 
-        df["color"] = df["labels"].apply(lambda x: "C0" if x==-1 else f"C{(x%9)+1}")
+        # Create a colormap
+        n_clusters = len(df['labels'].unique())
+        colors = plt.cm.rainbow(np.linspace(0, 1, n_clusters))
 
-        df.plot(
-            kind="scatter",
-            x="X",
-            y="Y",
-            c="labels",
-            s=0.75,
-            alpha=0.8,
-            linewidth=0,
-            color=df["color"],
-            ax=ax,
-            colorbar=False,
-        )
+        # Plot each cluster
+        for label, color in zip(df['labels'].unique(), colors):
+            mask = df['labels'] == label
+            ax.scatter(df.loc[mask, 'X'], df.loc[mask, 'Y'], 
+                       c=[color], s=1, alpha=0.7, linewidth=0)
 
+        # Add cluster summaries
         for label in self.cluster_summaries.keys():
             if label == -1:
                 continue
             summary = self.cluster_summaries[label]
             position = self.cluster_centers[label]
-            t= ax.text(
+            t = ax.text(
                 position[0],
                 position[1],
                 summary,
                 horizontalalignment='center',
                 verticalalignment='center',
-                fontsize=4,
+                fontsize=8,
+                fontweight='bold',
+                color='black'
             )
-            t.set_bbox(dict(facecolor='white', alpha=0.9, linewidth=0, boxstyle='square,pad=0.1'))
-        ax.set_axis_off()
+            t.set_bbox(dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.5'))
 
+        ax.set_axis_off()
+        plt.tight_layout()
+        plt.show()
+        
     def _show_plotly(self, df):
         fig = px.scatter(
             df,
