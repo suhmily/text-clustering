@@ -1,7 +1,7 @@
-import json
 import logging
 import os
 import random
+import json
 import textwrap
 from collections import Counter, defaultdict
 
@@ -9,24 +9,23 @@ import faiss
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import plotly.express as px
 from huggingface_hub import InferenceClient
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import DBSCAN
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 from umap import UMAP
+from matplotlib.colors import LinearSegmentedColormap
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+
+from datasets import config
+config.HF_DATASETS_CACHE="/mmu_nlp_hdd/suzhou03/data/data"
 
 logging.basicConfig(level=logging.INFO)
 
-
-DEFAULT_INSTRUCTION = (
-    instruction
-) = "Use three words total (comma separated)\
-to describe general topics in above texts. Under no circumstances use enumeration. \
-Example format: Tree, Cat, Fireman"
-
+DEFAULT_INSTRUCTION = "Use three words total (comma separated) to describe general topics in above texts. Under no circumstances use enumeration. Example format: Tree, Cat, Fireman"
 DEFAULT_TEMPLATE = "<s>[INST]{examples}\n\n{instruction}[/INST]"
-
 
 class ClusterClassifier:
     def __init__(
@@ -38,11 +37,12 @@ class ClusterClassifier:
         embed_agg_strategy=None,
         umap_components=2,
         umap_metric="cosine",
-        dbscan_eps=0.08,
-        dbscan_min_samples=50,
-        dbscan_n_jobs=16,
+        dbscan_eps=0.5,
+        dbscan_min_samples=5,
+        dbscan_n_jobs=-1,
         summary_create=True,
         summary_model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+        summary_model_path="/nlp_group/decapoda-research/Mixtral-8x7B-Instruct-v0.1",
         topic_mode="multiple_topics",
         summary_n_examples=10,
         summary_chunk_size=420,
@@ -70,15 +70,8 @@ class ClusterClassifier:
         self.summary_chunk_size = summary_chunk_size
         self.summary_model_token = summary_model_token
 
-        if summary_template is None:
-            self.summary_template = DEFAULT_TEMPLATE
-        else:
-            self.summary_template = summary_template
-
-        if summary_instruction is None:
-            self.summary_instruction = DEFAULT_INSTRUCTION
-        else:
-            self.summary_instruction = summary_instruction
+        self.summary_template = summary_template or DEFAULT_TEMPLATE
+        self.summary_instruction = summary_instruction or DEFAULT_INSTRUCTION
 
         self.embeddings = None
         self.faiss_index = None
@@ -93,6 +86,15 @@ class ClusterClassifier:
             self.embed_model_name, device=self.embed_device
         )
         self.embed_model.max_seq_length = self.embed_max_seq_length
+
+        self.summary_model_path = summary_model_path
+        self.pipe = pipeline(
+            "text-generation",
+            model=self.summary_model_path,
+            model_kwargs={"torch_dtype": torch.float16, "load_in_4bit": True},
+            device_map = "auto",
+        )
+
 
     def fit(self, texts, embeddings=None):
         self.texts = texts
@@ -110,6 +112,9 @@ class ClusterClassifier:
         self.projections, self.umap_mapper = self.project(self.embeddings)
         logging.info("dbscan clustering...")
         self.cluster_labels = self.cluster(self.projections)
+        
+        # logging.info("optimizing parameters...")
+        # self.optimize_parameters()
 
         self.id2cluster = {
             index: label for index, label in enumerate(self.cluster_labels)
@@ -151,7 +156,6 @@ class ClusterClassifier:
             convert_to_numpy=True,
             normalize_embeddings=True,
         )
-
         return embeddings
 
     def project(self, embeddings):
@@ -161,16 +165,50 @@ class ClusterClassifier:
         return mapper.embedding_, mapper
 
     def cluster(self, embeddings):
-        print(
-            f"Using DBSCAN (eps, nim_samples)=({self.dbscan_eps,}, {self.dbscan_min_samples})"
-        )
         clustering = DBSCAN(
             eps=self.dbscan_eps,
             min_samples=self.dbscan_min_samples,
             n_jobs=self.dbscan_n_jobs,
         ).fit(embeddings)
-
         return clustering.labels_
+
+    def optimize_parameters(self, target_noise_ratio=0.1, max_iterations=10):
+        current_noise_ratio = self.calculate_noise_ratio()
+        print(f"Initial noise ratio: {current_noise_ratio:.2%}")
+
+        for i in range(max_iterations):
+            if current_noise_ratio <= target_noise_ratio:
+                break
+
+            # Increase eps if noise ratio is too high
+            if current_noise_ratio > target_noise_ratio:
+                self.dbscan_eps *= 1.5
+
+            # Decrease min_samples if noise ratio is still too high
+            if i > 5 and current_noise_ratio > target_noise_ratio:
+                self.dbscan_min_samples = max(3, self.dbscan_min_samples - 1)
+
+            self.cluster_labels = self.cluster(self.projections)
+            current_noise_ratio = self.calculate_noise_ratio()
+            print(f"Iteration {i+1}: eps={self.dbscan_eps:.3f}, min_samples={self.dbscan_min_samples}, noise ratio: {current_noise_ratio:.2%}")
+
+        print(f"Final parameters: eps={self.dbscan_eps:.3f}, min_samples={self.dbscan_min_samples}")
+        print(f"Final noise ratio: {current_noise_ratio:.2%}")
+
+    def plot_k_distance(self, k=5):
+        nbrs = NearestNeighbors(n_neighbors=k+1, metric='euclidean').fit(self.projections)
+        distances, _ = nbrs.kneighbors(self.projections)
+        k_distances = np.sort(distances[:, k])
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(k_distances)), k_distances)
+        plt.xlabel('Points')
+        plt.ylabel(f'{k}-th nearest neighbor distance')
+        plt.title(f'{k}-distance Graph')
+        plt.show()
+
+        print(f"Suggested eps value: Look for the 'elbow' in this plot.")
+        print(f"Current eps value: {self.dbscan_eps:.3f}")
 
     def build_faiss_index(self, embeddings):
         index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -179,10 +217,9 @@ class ClusterClassifier:
 
     def summarize(self, texts, labels):
         unique_labels = len(set(labels)) - 1  # exclude the "-1" label
-        client = InferenceClient(self.summary_model, token=self.summary_model_token)
         cluster_summaries = {-1: "None"}
 
-        for label in range(unique_labels):
+        for label in tqdm(range(unique_labels)):
             ids = np.random.choice(self.label2docs[label], self.summary_n_examples)
             examples = "\n\n".join(
                 [
@@ -191,13 +228,21 @@ class ClusterClassifier:
                 ]
             )
 
-            request = self.summary_template.format(
-                examples=examples, instruction=self.summary_instruction
-            )
-            response = client.text_generation(request)
-            if label == 0:
-                print(f"Request:\n{request}")
-            cluster_summaries[label] = self._postprocess_response(response)
+            messages = [{"role": "user", "content": f"{examples}\n\n{self.summary_instruction}"}]
+            
+            outputs = self.pipe(messages, max_new_tokens=50, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
+            try:
+                response = outputs[0]['generated_text']
+                assistant_message = [msg for msg in response if msg['role'] == 'assistant'][0]
+                response_content = assistant_message['content']
+            except Exception as e:
+                print(f"Error processing pipeline output for label {label}: {e}")
+                print(f"Raw output: {outputs}")
+                response_content = "Error processing response"
+            
+            # if label == 0:
+            print(f"Request:\n{messages}\nResponse:\n{response_content}")
+            cluster_summaries[label] = self._postprocess_response(response_content)
         print(f"Number of clusters is {len(cluster_summaries)}")
         return cluster_summaries
 
@@ -253,7 +298,7 @@ class ClusterClassifier:
 
     def load(self, folder):
         if not os.path.exists(folder):
-            raise ValueError(f"The folder '{folder}' does not exsit.")
+            raise ValueError(f"The folder '{folder}' does not exist.")
 
         with open(f"{folder}/embeddings.npy", "rb") as f:
             self.embeddings = np.load(f)
@@ -276,7 +321,6 @@ class ClusterClassifier:
                 for key in keys:
                     self.cluster_summaries[int(key)] = self.cluster_summaries.pop(key)
 
-        # those objects can be inferred and don't need to be saved/loaded
         self.id2cluster = {
             index: label for index, label in enumerate(self.cluster_labels)
         }
@@ -310,39 +354,59 @@ class ClusterClassifier:
     def _show_mpl(self, df):
         fig, ax = plt.subplots(figsize=(20, 16), dpi=300)
 
-        # Create a colormap
-        n_clusters = len(df['labels'].unique())
-        colors = plt.cm.rainbow(np.linspace(0, 1, n_clusters))
+        # Create a custom colormap with vibrant colors
+        colors = [
+            "#0F0A0A",
+            "#FF6600",
+            "#FFBE00",
+            "#496767",
+            "#87A19E",
+            "#FF9200",
+            "#0F3538",
+            "#F8E08E",
+            "#0F2021",
+            "#FAFAF0"
+        ]
+        n_bins = len(colors)
+        cmap = LinearSegmentedColormap.from_list("custom", colors, N=n_bins)
 
         # Plot each cluster
-        for label, color in zip(df['labels'].unique(), colors):
+        unique_labels = sorted(df['labels'].unique())
+        for label in unique_labels:
+            if label == -1:
+                color = '#808080'  # Noise points in grey
+            else:
+                color = cmap(label / max(unique_labels))
+            
             mask = df['labels'] == label
             ax.scatter(df.loc[mask, 'X'], df.loc[mask, 'Y'], 
-                       c=[color], s=1, alpha=0.7, linewidth=0)
+                       c=[color], s=3, alpha=0.8, linewidth=0)
 
-        # Add cluster summaries
         for label in self.cluster_summaries.keys():
             if label == -1:
                 continue
             summary = self.cluster_summaries[label]
             position = self.cluster_centers[label]
-            t = ax.text(
+            t= ax.text(
                 position[0],
                 position[1],
                 summary,
                 horizontalalignment='center',
                 verticalalignment='center',
-                fontsize=8,
+                fontsize=10,
                 fontweight='bold',
                 color='black'
             )
-            t.set_bbox(dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.5'))
+            t.set_bbox(dict(facecolor='white', alpha=0.9, linewidth=0, boxstyle='square,pad=0.1'))
 
+        ax.set_facecolor('#F0F0F0')  # Light grey background
         ax.set_axis_off()
         plt.tight_layout()
         plt.show()
-        
+
     def _show_plotly(self, df):
+        import plotly.express as px
+
         fig = px.scatter(
             df,
             x="X",
@@ -357,7 +421,7 @@ class ClusterClassifier:
         fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>")
 
         fig.update_traces(
-            marker=dict(size=1, opacity=0.8),  # color="white"
+            marker=dict(size=1, opacity=0.8),
             selector=dict(mode="markers"),
         )
 
@@ -365,7 +429,6 @@ class ClusterClassifier:
             template="plotly_dark",
         )
 
-        # show cluster summaries
         for label in self.cluster_summaries.keys():
             if label == -1:
                 continue
@@ -381,3 +444,9 @@ class ClusterClassifier:
             )
 
         fig.show()
+
+    def calculate_noise_ratio(self):
+        total_points = len(self.cluster_labels)
+        noise_points = np.sum(self.cluster_labels == -1)
+        noise_ratio = noise_points / total_points
+        return noise_ratio
