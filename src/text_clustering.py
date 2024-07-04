@@ -449,3 +449,39 @@ class ClusterClassifier:
         noise_points = np.sum(self.cluster_labels == 0)
         noise_ratio = noise_points / total_points
         return noise_ratio
+
+
+    def print_cluster_examples(self, cluster_label, num_examples=5, max_chars=20000, wrap_width=None):
+        """
+        Print full text examples from a specific cluster with controlled text wrapping.
+        
+        :param cluster_label: The label of the cluster to print examples from.
+        :param num_examples: The number of examples to print (default is 5).
+        :param max_chars: The maximum number of characters to print for each example (default is 20000).
+        :param wrap_width: The width at which to wrap text. If None, text will not be wrapped.
+        """
+        if cluster_label not in self.label2docs:
+            print(f"Cluster {cluster_label} does not exist.")
+            return
+        
+        doc_indices = self.label2docs[cluster_label]
+        num_examples = min(num_examples, len(doc_indices))
+        
+        print(f"Cluster {cluster_label} examples:")
+        print(f"Cluster summary: {self.cluster_summaries.get(cluster_label, 'No summary available')}")
+        print(f"Number of documents in cluster: {len(doc_indices)}")
+        print("\nRandom examples:")
+        
+        for i, idx in enumerate(random.sample(doc_indices, num_examples)):
+            print(f"\nExample {i+1}:")
+            text = self.texts[idx]
+            print(f"Text length: {len(text)} characters")
+            print("Full text:")
+            if wrap_width:
+                print(textwrap.fill(text[:max_chars], width=wrap_width))
+            else:
+                print(text[:max_chars])
+            if len(text) > max_chars:
+                print(f"\n... (truncated, {len(text) - max_chars} more characters)")
+        
+        print("\n" + "="*50 + "\n")
