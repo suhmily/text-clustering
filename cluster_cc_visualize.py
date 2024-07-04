@@ -38,7 +38,7 @@ def read_and_parse_parquet(file_path: str, max_chunks: int = None, max_length: i
         print(f"读取文件时出错: {e}")
 
 # 读取并解析数据
-parsed_data = list(read_and_parse_parquet(hdfs_path, max_chunks=1))[:1000]
+parsed_data = list(read_and_parse_parquet(hdfs_path, max_chunks=5))
 
 if parsed_data:
     print(f"\n成功读取并解析数据")
@@ -55,7 +55,6 @@ if parsed_data:
 else:
     print("无法读取或解析数据")
 
-
 # %%
 import pandas as pd
 from src.text_clustering import ClusterClassifier
@@ -67,11 +66,16 @@ import matplotlib.pyplot as plt
 # pandas_df = pd.DataFrame({'content': ["text1", "text2", "text3"]})
 
 # Create an instance of ClusterClassifier
-cc = ClusterClassifier(embed_device="cuda")  # Use "cuda" if you have a GPU
+cc = ClusterClassifier(
+    embed_device="cuda",
+)
 
 # Run the pipeline on the 'content' column
 
 embs, labels, summaries = cc.fit(texts)
+cc.optimize_parameters(target_noise_ratio=0.1, max_iterations=10)
+# Plot k-distance graph for eps selection
+cc.plot_k_distance(k=5)
 
 # Customize color scheme (optional)
 # default_cycler = (cycler(color=[
@@ -86,20 +90,17 @@ cc.show(interactive=False)
 # Save the classifier (optional)
 cc.save("./content_clusters")
 
-# Print cluster summaries
-for i, summary in enumerate(summaries):
-    print(f"Cluster {i}: {summary}")
 
 # If you want to classify new texts later:
 # new_texts = ["Some new text", "Another new text"]
 # cluster_labels, embeddings = cc.infer(new_texts, top_k=1)
 
-
 # %%
-import pandas as pd
 import matplotlib.pyplot as plt
 from collections import Counter
 import seaborn as sns
+import numpy as np
+from matplotlib.patches import Rectangle
 
 def visualize_cluster_proportions(labels, summaries):
     # Count the number of items in each cluster
@@ -116,42 +117,46 @@ def visualize_cluster_proportions(labels, summaries):
     total_count = sum(counts) + noise_count
     noise_proportion = noise_count / total_count if total_count > 0 else 0
     
+    # Calculate percentages
+    percentages = [count / sum(counts) * 100 for count in counts]
+    
     # Create a color palette
     colors = sns.color_palette("husl", len(cluster_labels))
     
-    # Create cluster labels with summaries
-    cluster_summaries = [f'Cluster {label}: {summaries.get(label, "No summary")}' for label in cluster_labels]
+    # Create a figure with two subplots side by side
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10), gridspec_kw={'width_ratios': [1, 1]})
     
-    # Create a pie chart
-    plt.figure(figsize=(14, 10))
-    wedges, texts, autotexts = plt.pie(counts, autopct='%1.1f%%', startangle=90, colors=colors)
+    # Create a pie chart on the left subplot
+    wedges, texts, autotexts = ax1.pie(counts, autopct='%1.1f%%', startangle=90, colors=colors,
+                                       textprops=dict(color="w", weight="bold", size=10))
     
-    # Ensure the percentage text is visible
-    for autotext in autotexts:
-        autotext.set_color('black')
-        autotext.set_fontweight('bold')
-        autotext.set_fontsize(10)
-    
-    plt.title('Proportion of Data Points in Each Cluster', fontsize=16)
+    # Add title to the pie chart
+    ax1.set_title('Proportion of Data Points in Each Cluster', fontsize=16)
     
     # Add a note about noise proportion
-    plt.annotate(f'Noise: {noise_proportion:.1%}', xy=(0.95, 0.05), xycoords='axes fraction', 
+    ax1.annotate(f'Noise: {noise_proportion:.1%}', xy=(0.95, 0.05), xycoords='axes fraction',
                  horizontalalignment='right', verticalalignment='bottom', fontsize=10)
     
-    plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
+    # Ensure the pie chart is circular
+    ax1.axis('equal')
     
-    # Add a legend with cluster summaries
-    plt.legend(wedges, cluster_summaries, 
-               title="Clusters and Summaries", loc="center left", 
-               bbox_to_anchor=(1, 0, 0.5, 1), fontsize=10)
+    # Create colored text with percentages for each cluster on the right subplot
+    ax2.set_ylim(0, 1)
+    ax2.set_xlim(0, 1)
+    ax2.axis('off')  # Turn off axes for the text subplot
     
+    for i, (label, summary, color, percentage) in enumerate(zip(cluster_labels, summaries.values(), colors, percentages)):
+        y_position = 1 - (i + 1) / (len(cluster_labels) + 1)
+        rect = Rectangle((0, y_position), 0.03, 0.03, facecolor=color, edgecolor='none')
+        ax2.add_patch(rect)
+        ax2.text(0.05, y_position, f'Cluster {label} ({percentage:.1f}%): {summary}', 
+                 va='center', ha='left', wrap=True, fontsize=12)
+    
+    # Adjust layout and display the plot
     plt.tight_layout()
     plt.show()
-
-# Assuming you have already run the clustering and have the labels and summaries
-# labels = cc.cluster_labels
+    # labels = cc.cluster_labels
 # summaries = cc.cluster_summaries
-
 visualize_cluster_proportions(labels, summaries)
 
 # %%

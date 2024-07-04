@@ -93,7 +93,13 @@ class ClusterClassifier:
             model=self.summary_model_path,
             model_kwargs={"torch_dtype": torch.float16, "load_in_4bit": True},
             device_map = "auto",
+            batch_size = 8
         )
+
+        # Set padding token for the tokenizer
+        if self.pipe.tokenizer.pad_token is None:
+            self.pipe.tokenizer.pad_token = self.pipe.tokenizer.eos_token
+            self.pipe.tokenizer.pad_token_id = self.pipe.tokenizer.eos_token_id
 
 
     def fit(self, texts, embeddings=None):
@@ -172,7 +178,7 @@ class ClusterClassifier:
         ).fit(embeddings)
         return clustering.labels_
 
-    def optimize_parameters(self, target_noise_ratio=0.1, max_iterations=10):
+    def optimize_parameters(self, target_noise_ratio=0.001, max_iterations=10):
         current_noise_ratio = self.calculate_noise_ratio()
         print(f"Initial noise ratio: {current_noise_ratio:.2%}")
 
@@ -182,7 +188,7 @@ class ClusterClassifier:
 
             # Increase eps if noise ratio is too high
             if current_noise_ratio > target_noise_ratio:
-                self.dbscan_eps *= 1.5
+                self.dbscan_eps /= 1.5
 
             # Decrease min_samples if noise ratio is still too high
             if i > 5 and current_noise_ratio > target_noise_ratio:
@@ -216,10 +222,13 @@ class ClusterClassifier:
         return index
 
     def summarize(self, texts, labels):
-        unique_labels = len(set(labels)) - 1  # exclude the "-1" label
-        cluster_summaries = {-1: "None"}
+        
+        unique_labels = sorted(set(labels) - {-1})  # exclude the "-1" label
+        cluster_summaries = {int(-1): "None"}
 
-        for label in tqdm(range(unique_labels)):
+        # Prepare batch of examples for all clusters
+        batch_messages = []
+        for label in unique_labels:
             ids = np.random.choice(self.label2docs[label], self.summary_n_examples)
             examples = "\n\n".join(
                 [
@@ -227,24 +236,27 @@ class ClusterClassifier:
                     for i, _id in enumerate(ids)
                 ]
             )
+            message = [{"role": "user", "content": f"{examples}\n\n{self.summary_instruction}"}]
+            batch_messages.append(message)
 
-            messages = [{"role": "user", "content": f"{examples}\n\n{self.summary_instruction}"}]
-            
-            outputs = self.pipe(messages, max_new_tokens=50, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
+        # Process batch
+        outputs = self.pipe(batch_messages, max_new_tokens=50, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
+
+        # Process outputs
+        for label, output in zip(unique_labels, outputs):
             try:
-                response = outputs[0]['generated_text']
+                response = output[0]['generated_text']
                 assistant_message = [msg for msg in response if msg['role'] == 'assistant'][0]
                 response_content = assistant_message['content']
+                cluster_summaries[label] = self._postprocess_response(response_content)
             except Exception as e:
                 print(f"Error processing pipeline output for label {label}: {e}")
-                print(f"Raw output: {outputs}")
-                response_content = "Error processing response"
-            
-            # if label == 0:
-            print(f"Request:\n{messages}\nResponse:\n{response_content}")
-            cluster_summaries[label] = self._postprocess_response(response_content)
+                print(f"Raw output: {output}")
+                cluster_summaries[label] = "Error processing response"
+
         print(f"Number of clusters is {len(cluster_summaries)}")
         return cluster_summaries
+
 
     def _postprocess_response(self, response):
         if self.topic_mode == "multiple_topics":
@@ -294,7 +306,7 @@ class ClusterClassifier:
 
         if self.cluster_summaries is not None:
             with open(f"{folder}/cluster_summaries.json", "w") as f:
-                json.dump(self.cluster_summaries, f)
+                json.dump({int(key): value for key, value in self.cluster_summaries.items()}, f)
 
     def load(self, folder):
         if not os.path.exists(folder):
@@ -352,58 +364,45 @@ class ClusterClassifier:
             self._show_mpl(df)
 
     def _show_mpl(self, df):
-        fig, ax = plt.subplots(figsize=(20, 16), dpi=300)
-
-        # Create a custom colormap with vibrant colors
-        colors = [
-            "#0F0A0A",
-            "#FF6600",
-            "#FFBE00",
-            "#496767",
-            "#87A19E",
-            "#FF9200",
-            "#0F3538",
-            "#F8E08E",
-            "#0F2021",
-            "#FAFAF0"
-        ]
-        n_bins = len(colors)
-        cmap = LinearSegmentedColormap.from_list("custom", colors, N=n_bins)
-
-        # Plot each cluster
-        unique_labels = sorted(df['labels'].unique())
-        for label in unique_labels:
-            if label == -1:
-                color = '#808080'  # Noise points in grey
-            else:
-                color = cmap(label / max(unique_labels))
-            
-            mask = df['labels'] == label
-            ax.scatter(df.loc[mask, 'X'], df.loc[mask, 'Y'], 
-                       c=[color], s=3, alpha=0.8, linewidth=0)
-
+        fig, ax = plt.subplots(figsize=(12, 8), dpi=300)
+        
+        # 创建颜色映射
+        unique_labels = df['labels'].unique()
+        color_map = {-1: 'C0'}  # 噪声点用 'C0'
+        for i, label in enumerate(unique_labels):
+            if label != -1:
+                color_map[label] = f'C{(i % 9) + 1}'
+        
+        # 使用 ax.scatter() 绘制散点图
+        scatter = ax.scatter(
+            df['X'],
+            df['Y'],
+            c=[color_map[label] for label in df['labels']],
+            s=0.75,
+            alpha=0.8,
+            linewidths=0
+        )
+        
+        # 添加聚类标签和摘要
         for label in self.cluster_summaries.keys():
             if label == -1:
                 continue
             summary = self.cluster_summaries[label]
             position = self.cluster_centers[label]
-            t= ax.text(
+            t = ax.text(
                 position[0],
                 position[1],
                 summary,
                 horizontalalignment='center',
                 verticalalignment='center',
-                fontsize=10,
-                fontweight='bold',
-                color='black'
+                fontsize=4,
             )
-            t.set_bbox(dict(facecolor='white', alpha=0.9, linewidth=0, boxstyle='square,pad=0.1'))
-
-        ax.set_facecolor('#F0F0F0')  # Light grey background
+            t.set_bbox(dict(facecolor='white', alpha=0.9, edgecolor='none', boxstyle='round,pad=0.1'))
+        
         ax.set_axis_off()
-        plt.tight_layout()
-        plt.show()
-
+        
+        return fig, ax
+        
     def _show_plotly(self, df):
         import plotly.express as px
 
@@ -447,6 +446,6 @@ class ClusterClassifier:
 
     def calculate_noise_ratio(self):
         total_points = len(self.cluster_labels)
-        noise_points = np.sum(self.cluster_labels == -1)
+        noise_points = np.sum(self.cluster_labels == 0)
         noise_ratio = noise_points / total_points
         return noise_ratio
