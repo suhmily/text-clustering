@@ -3,3 +3,8 @@ data_*/
 *.pyc
 *.json
 *.npy
+*.index
+*.txt
+*.jpg
+*.png
+*.bak
